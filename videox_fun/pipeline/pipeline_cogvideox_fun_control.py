@@ -654,6 +654,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
         guidance_scale: float = 6,
+        strength: float = 1.0,
         use_dynamic_cfg: bool = False,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
@@ -704,6 +705,11 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
                 Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
                 1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
                 usually at the expense of lower image quality.
+            strength (`float`, *optional*, defaults to 1.0):
+                **[ADDED]** Denoising strength for video-to-video generation. Controls where in the denoising process
+                to start. `strength=1.0` performs full denoising (default), while `strength=0.7` only denoise the last
+                70% of timesteps. Only used when `latents` is provided. Enables partial denoising from intermediate
+                noise levels.
             num_videos_per_prompt (`int`, *optional*, defaults to 1):
                 The number of videos to generate per prompt.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
@@ -799,9 +805,24 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
 
+        # ============================================================================
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        # [MODIFIED] Added strength parameter support for partial denoising
+        # ============================================================================
+        # IMPORTANT: Always initialize scheduler with full timesteps first
+        timesteps_full, num_inference_steps_full = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        
+        # Then optionally slice to partial timesteps based on strength
+        if strength < 1.0 and latents is not None:
+            # Start from intermediate noise level instead of full denoising
+            print("Full Timesteps are: ", timesteps_full)
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            print(f"Using strength {strength} for partial denoising. Sliced timesteps are: ", timesteps)
+        else:
+            # Standard full denoising from start
+            timesteps, num_inference_steps = timesteps_full, num_inference_steps_full
         self._num_timesteps = len(timesteps)
+        # ============================================================================
         if comfyui_progressbar:
             from comfy.utils import ProgressBar
             pbar = ProgressBar(num_inference_steps + 2)
@@ -829,20 +850,42 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
             video_length = num_frames
             control_video = control_video[:, :, :video_length]
 
-        # 5. Prepare latents.
+        # ============================================================================
+        # 5. Prepare latents
+        # [MODIFIED] Handle strength-based partial denoising for video-to-video
+        # ============================================================================
         latent_channels = self.vae.config.latent_channels
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            latent_channels,
-            num_frames,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        
+        if strength < 1.0 and latents is not None:
+            # PARTIAL DENOISING: Add noise to clean latent to match t_start noise level
+            # latents contains clean encoded original video
+            clean_latents = latents.to(device=device, dtype=prompt_embeds.dtype)
+            
+            # Generate noise with same shape as latents
+            noise = torch.randn(clean_latents.shape, device=device, dtype=clean_latents.dtype)
+            
+            # Get the starting timestep from our sliced timesteps
+            t_start = timesteps[0]
+            
+            # Add noise to clean latent to bring it to t_start noise level
+            # scheduler.add_noise() applies proper alpha/beta scaling, so NO init_noise_sigma needed
+            latents = self.scheduler.add_noise(clean_latents, noise, timesteps=torch.tensor([t_start], device=device))
+            print(f"[STRENGTH={strength}] Added noise to clean latent at timestep {t_start}")
+        else:
+            # FULL DENOISING: Sample random noise and scale by init_noise_sigma
+            latents = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                latent_channels,
+                num_frames,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                None,  # Force random sampling for full denoising
+            )
         print("Latents Shape after preparation: ", latents.shape)
+        # ============================================================================
         if comfyui_progressbar:
             pbar.update(1)
 

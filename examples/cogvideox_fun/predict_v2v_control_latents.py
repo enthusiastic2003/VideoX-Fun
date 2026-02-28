@@ -125,7 +125,7 @@ fps                 = 30
 weight_dtype            = torch.bfloat16
 control_video           = "asset/depth_map_video_60frames_896x512.mp4"
 og_video                = "asset/yoga_resized_896x512_30fps.mp4"  # just for reference, not used in generation
-
+og_video                = None  # just for reference, not used in generation
 
 # prompts
 prompt                  = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
@@ -250,7 +250,7 @@ if video_length != 1 and transformer.config.patch_size_t is not None and latent_
 input_video, input_video_mask, ref_image, clip_image = get_video_to_video_latent(control_video, video_length=video_length, sample_size=sample_size, fps=fps)
 
 # Encode original video to latents
-original_vae_latents = encode_original_video_to_latents(og_video, video_length, sample_size, fps, pipeline, vae, device)
+original_vae_latents = encode_original_video_to_latents(og_video, video_length, sample_size, fps, pipeline, vae, device) if og_video is not None else None
 
 with torch.no_grad():
     sample = pipeline(
@@ -265,6 +265,7 @@ with torch.no_grad():
 
         control_video = input_video,
         latents=original_vae_latents,
+        strength=0.9 if og_video is not None else 1.0,  # you can adjust the strength to control how much noise is added to the original video latents. A higher strength means more noise and more deviation from the original video.
     ).videos
 
 if lora_path is not None:
