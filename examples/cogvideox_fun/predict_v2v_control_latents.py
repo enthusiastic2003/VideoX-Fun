@@ -26,6 +26,7 @@ from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8, r
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.utils import get_video_to_video_latent, save_videos_grid
 from videox_fun.dist import set_multi_gpus_devices, shard_model
+from diffusers.image_processor import VaeImageProcessor
 
 # GPU memory mode, which can be chosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
 # model_full_load means that the entire model will be moved to the GPU.

@@ -840,6 +840,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
             generator,
             latents,
         )
+        print("Latents Shape after preparation: ", latents.shape)
         if comfyui_progressbar:
             pbar.update(1)
 
@@ -857,8 +858,10 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         control_video_latents_input = (
             torch.cat([control_video_latents] * 2) if do_classifier_free_guidance else control_video_latents
         )
+        print("Control Video Shape after encoding: ", control_video_latents_input.shape)
         control_latents = rearrange(control_video_latents_input, "b c f h w -> b f c h w")
-
+        print("Control Latents Shape after rearrange: ", control_latents.shape)
+        exit(0)
         if comfyui_progressbar:
             pbar.update(1)
 

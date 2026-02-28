@@ -1,28 +1,37 @@
-Pillow
-einops
+# Core
+numpy==1.26.4
+torch==2.2.0
+torchvision
 safetensors
-timm
-tomesd
-librosa
-torch>=2.1.2
-torchdiffeq
-torchsde
-decord
-datasets
-numpy
-scikit-image
-opencv-python
+einops
 omegaconf
 SentencePiece
-albumentations
+
+# Diffusion stack (PINNED)
+diffusers==0.25.0
+huggingface_hub==0.19.4
+transformers==4.36.2
+accelerate==0.24.1
+
+# Video / image
+opencv-python-headless==4.8.1.78
+scikit-image
 imageio[ffmpeg]
 imageio[pyav]
+decord
+albumentations
+Pillow
+
+# Models / utils
+timm
+tomesd
+torchdiffeq
+torchsde
+onnxruntime
 tensorboard
 beautifulsoup4
 ftfy
 func_timeout
-onnxruntime
-accelerate>=0.25.0
-gradio>=3.41.2
-diffusers>=0.30.1
-transformers>=4.46.2
+
+# Optional UI (SAFE version)
+gradio==3.50.2
