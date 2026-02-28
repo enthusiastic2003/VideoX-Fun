@@ -309,6 +309,29 @@ def get_video_to_video_latent(input_video_path, video_length, sample_size, fps=N
             ref_image = ref_image.unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
     return input_video, input_video_mask, ref_image, clip_image
 
+def get_video_to_video_latent_simple(input_video_path, video_length, sample_size, fps=None):
+    """
+    Simplified wrapper for get_video_to_video_latent that excludes validation_video_mask and ref_image.
+    
+    Args:
+        input_video_path: Path to video file or pre-loaded video frames
+        video_length: Number of frames to extract
+        sample_size: Target size as [height, width]
+        fps: Target frames per second (optional)
+    
+    Returns:
+        tuple: (input_video, input_video_mask) tensors
+    """
+    input_video, input_video_mask, _, _ = get_video_to_video_latent(
+        input_video_path=input_video_path,
+        video_length=video_length,
+        sample_size=sample_size,
+        fps=fps,
+        validation_video_mask=None,
+        ref_image=None
+    )
+    return input_video, input_video_mask
+
 def get_image_latent(ref_image=None, sample_size=None, padding=False):
     if ref_image is not None:
         if isinstance(ref_image, str):

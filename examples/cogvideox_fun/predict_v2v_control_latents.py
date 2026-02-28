@@ -24,9 +24,57 @@ from videox_fun.pipeline import (CogVideoXFunControlPipeline,
 from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8, replace_parameters_by_name,
                                               convert_weight_dtype_wrapper)
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
-from videox_fun.utils.utils import get_video_to_video_latent, save_videos_grid
+from videox_fun.utils.utils import get_video_to_video_latent, save_videos_grid, get_video_to_video_latent_simple
 from videox_fun.dist import set_multi_gpus_devices, shard_model
 from diffusers.image_processor import VaeImageProcessor
+
+def encode_original_video_to_latents(og_video, video_length, sample_size, fps, pipeline, vae, device):
+    """
+    Encode the original video to VAE latents with preprocessing.
+    
+    Args:
+        og_video: Path to the original video file
+        video_length: Number of frames
+        sample_size: Target size as [height, width]
+        fps: Frames per second
+        pipeline: CogVideoXFunControlPipeline instance
+        vae: VAE model
+        device: Device to run on
+    
+    Returns:
+        Encoded VAE latents with shape [batch, frames, channels, height, width]
+    """
+    from einops import rearrange
+    
+    # Load original video
+    original_video, _ = get_video_to_video_latent_simple(og_video, video_length=video_length, sample_size=sample_size, fps=fps)
+    
+    # Apply preprocessing scheme like the pipeline does
+    original_video_length = original_video.shape[2]
+    original_video = rearrange(original_video, "b c f h w -> (b f) c h w")
+    original_video = pipeline.image_processor.preprocess(original_video, height=sample_size[0], width=sample_size[1])
+    original_video = original_video.to(dtype=torch.float32)
+    original_video = rearrange(original_video, "(b f) c h w -> b c f h w", f=original_video_length)
+    
+    # Encode to latents in batches
+    original_video = original_video.to(device=device, dtype=vae.dtype)
+    print("Shape of original video after preprocessing:", original_video.shape)
+    
+    with torch.no_grad():
+        bs = 1
+        new_latents = []
+        for i in range(0, original_video.shape[0], bs):
+            video_bs = original_video[i : i + bs]
+            original_vae_output = vae.encode(video_bs)
+            original_vae_latents_bs = original_vae_output[0].mode() if hasattr(original_vae_output[0], 'mode') else original_vae_output[0]
+            new_latents.append(original_vae_latents_bs)
+        original_vae_latents = torch.cat(new_latents, dim=0)
+        original_vae_latents = original_vae_latents * vae.config.scaling_factor
+    
+    original_vae_latents = rearrange(original_vae_latents, "b c f h w -> b f c h w")
+    print("Shape of original VAE latents:", original_vae_latents.shape)
+    
+    return original_vae_latents
 
 # GPU memory mode, which can be chosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
 # model_full_load means that the entire model will be moved to the GPU.
@@ -76,6 +124,8 @@ fps                 = 30
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
 weight_dtype            = torch.bfloat16
 control_video           = "asset/depth_map_video_60frames_896x512.mp4"
+og_video                = "asset/yoga_resized_896x512_30fps.mp4"  # just for reference, not used in generation
+
 
 # prompts
 prompt                  = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
@@ -147,8 +197,6 @@ scheduler = Chosen_Scheduler.from_pretrained(
     subfolder="scheduler"
 )
 
-# Get Latent for Video
-
 
 pipeline = CogVideoXFunControlPipeline(
     vae=vae,
@@ -201,6 +249,9 @@ if video_length != 1 and transformer.config.patch_size_t is not None and latent_
     video_length += additional_frames * vae.config.temporal_compression_ratio
 input_video, input_video_mask, ref_image, clip_image = get_video_to_video_latent(control_video, video_length=video_length, sample_size=sample_size, fps=fps)
 
+# Encode original video to latents
+original_vae_latents = encode_original_video_to_latents(og_video, video_length, sample_size, fps, pipeline, vae, device)
+
 with torch.no_grad():
     sample = pipeline(
         prompt, 
@@ -213,6 +264,7 @@ with torch.no_grad():
         num_inference_steps = num_inference_steps,
 
         control_video = input_video,
+        latents=original_vae_latents,
     ).videos
 
 if lora_path is not None:

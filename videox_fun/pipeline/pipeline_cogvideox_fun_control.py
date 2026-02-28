@@ -422,6 +422,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
     def prepare_latents(
         self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None
     ):
+        print(f"Latent status: {'Using provided latents' if latents is not None else 'Sampling new latents'}")
         shape = (
             batch_size,
             (num_frames - 1) // self.vae_scale_factor_temporal + 1,
@@ -439,6 +440,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         else:
             latents = latents.to(device)
+            print("Using provided latents")
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
@@ -861,7 +863,6 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         print("Control Video Shape after encoding: ", control_video_latents_input.shape)
         control_latents = rearrange(control_video_latents_input, "b c f h w -> b f c h w")
         print("Control Latents Shape after rearrange: ", control_latents.shape)
-        exit(0)
         if comfyui_progressbar:
             pbar.update(1)
 
