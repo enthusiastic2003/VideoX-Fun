@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import copy
 import inspect
 import math
 from dataclasses import dataclass
@@ -32,6 +32,8 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from einops import rearrange
 
+from videox_fun.models.cogvideox_transformer3d import KVInjectionAttnProcessor
+
 from ..models import (AutoencoderKLCogVideoX,
                               CogVideoXTransformer3DModel, T5EncoderModel,
                               T5Tokenizer)
@@ -45,7 +47,29 @@ EXAMPLE_DOC_STRING = """
         pass
         ```
 """
+def get_tensor_size(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size() / (1024**2)
+    elif isinstance(obj, dict):
+        return sum(get_tensor_size(v) for v in obj.values())
+    elif isinstance(obj, (list, tuple)):
+        return sum(get_tensor_size(item) for item in obj)
+    return 0
 
+def print_kv_cache_shapes(kv_cache, prefix=""):
+    """Print shapes and dtypes of all tensors in kv_cache structure"""
+    if isinstance(kv_cache, torch.Tensor):
+        print(f"{prefix}Tensor shape: {kv_cache.shape}, dtype: {kv_cache.dtype}, device: {kv_cache.device}")
+    elif isinstance(kv_cache, dict):
+        for k, v in kv_cache.items():
+            print(f"{prefix}[{k}]:")
+            print_kv_cache_shapes(v, prefix + "  ")
+    elif isinstance(kv_cache, (list, tuple)):
+        for i, item in enumerate(kv_cache):
+            print(f"{prefix}[{i}]:")
+            print_kv_cache_shapes(item, prefix + "  ")
+    else:
+        print(f"{prefix}{type(kv_cache).__name__}")
 
 # Copied from diffusers.models.embeddings.get_3d_rotary_pos_embed
 def get_3d_rotary_pos_embed(
@@ -234,7 +258,14 @@ class CogVideoXFunPipelineOutput(BaseOutput):
     """
 
     videos: torch.Tensor
-
+    
+def set_kv_injection_processors(transformer, mode="normal", store=None):
+    for i, block in enumerate(transformer.transformer_blocks):
+        block.attn1.processor = KVInjectionAttnProcessor(
+            mode=mode,
+            store=store,
+            block_idx=i,
+        )
 
 class CogVideoXFunControlPipeline(DiffusionPipeline):
     r"""
@@ -275,9 +306,16 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         vae: AutoencoderKLCogVideoX,
         transformer: CogVideoXTransformer3DModel,
         scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler],
+        pass_mode = None
     ):
         super().__init__()
 
+        self.kv_cache = {}
+        self.return_kv_cache = {}
+        if pass_mode is not None:
+            assert pass_mode in ["capture", "inject"], "pass_mode should be either 'capture' or 'inject'"
+            set_kv_injection_processors(transformer, mode=pass_mode, store=self.kv_cache)
+        
         self.register_modules(
             tokenizer=tokenizer, text_encoder=text_encoder, vae=vae, transformer=transformer, scheduler=scheduler
         )
@@ -295,6 +333,9 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         self.mask_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
+    
+    def get_kv_cache(self):
+        return self.return_kv_cache
 
     def _get_t5_prompt_embeds(
         self,
@@ -671,6 +712,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 226,
         comfyui_progressbar: bool = False,
+        directory_latents: Optional[str] = None,
     ) -> Union[CogVideoXFunPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -921,6 +963,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        kv_shapes_printed = False
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             # for DPM-solver++
@@ -945,6 +988,22 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
                     control_latents=control_latents,
                 )[0]
                 noise_pred = noise_pred.float()
+                
+                # Print KV cache shapes once on first iteration
+                if not kv_shapes_printed and self.kv_cache:
+                    print("\n=== KV Cache Structure ===")
+                    print_kv_cache_shapes(self.kv_cache)
+                    print("=========================\n")
+                    kv_shapes_printed = True
+                
+                kv_cache_size = get_tensor_size(self.kv_cache)
+                print(f"KV Cache size before CPU transfer: {kv_cache_size:.2f} MB")
+                
+                self.return_kv_cache[t] = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.kv_cache.items()}
+                
+                # Clear GPU cache to free memory
+                self.kv_cache.clear()
+                torch.cuda.empty_cache()
 
                 # perform guidance
                 if use_dynamic_cfg:
@@ -969,6 +1028,9 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
                         return_dict=False,
                     )
                 latents = latents.to(prompt_embeds.dtype)
+                # Save latents to a folder
+                if directory_latents is not None:
+                    torch.save(latents.cpu(), f"{directory_latents}/latents_step_{i}.pt")
 
                 # call the callback, if provided
                 if callback_on_step_end is not None:

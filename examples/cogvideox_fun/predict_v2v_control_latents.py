@@ -123,12 +123,15 @@ fps                 = 30
 # Use torch.float16 if GPU does not support torch.bfloat16
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
 weight_dtype            = torch.bfloat16
-control_video           = "asset/depth_map_video_60frames_896x512.mp4"
+# control_video           = "asset/yoga_rev_896x512.mp4"
+control_video           = "asset/depth_map_49_8fps.mp4"
 og_video                = "asset/yoga_resized_896x512_30fps.mp4"  # just for reference, not used in generation
-og_video                = None  # just for reference, not used in generation
-
+# og_video                = None  # just for reference, not used in generation
+directory_latents     = f"/home/venky/sirjanhansda/new_folder/VideoX-Fun/latents/{og_video.split('/')[-1].split('.')[0]}" if og_video else None  # directory to save latents, set to None if you don't want to save
+os.makedirs(directory_latents, exist_ok=True) if directory_latents is not None else None
 # prompts
 prompt                  = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
+# prompt                  = "A photorealistic white American woman with light blonde hair performing a slow, controlled yoga transition in a brightly lit room, facing the camera. She begins the pose with one arm gently reaching behind her back, the shoulder open and the chest lifted, maintaining steady balance and calm breathing. As the movement continues, she smoothly brings the same arm forward, extending it in front of her body in a deliberate, mindful motion. Sunlight streams through a nearby window, softly illuminating her face, arms, and clothing throughout the transition. She is wearing black yoga pants and a black tank top, her hair loose around her shoulders. Her facial features remain clearly visible, with a calm, focused expression and a natural, relaxed presence. The scene feels realistic, serene, and grounded, with natural lighting and an unposed, authentic atmosphere."
 negative_prompt         = "The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion. "
 guidance_scale          = 6.0
 seed                    = 43
@@ -136,6 +139,8 @@ num_inference_steps     = 50
 lora_weight             = 0.55
 save_path               = "samples/cogvideox-fun-videos_control"
 
+source_generation_prompt = "N/A"
+source_dual_pipeline = False  # whether to use dual pipeline for source video denoising
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 
 transformer = CogVideoXTransformer3DModel.from_pretrained(
@@ -204,6 +209,7 @@ pipeline = CogVideoXFunControlPipeline(
     text_encoder=text_encoder,
     transformer=transformer,
     scheduler=scheduler,
+    pass_mode="capture"
 )
 if ulysses_degree > 1 or ring_degree > 1:
     from functools import partial
@@ -262,12 +268,16 @@ with torch.no_grad():
         generator   = generator,
         guidance_scale = guidance_scale,
         num_inference_steps = num_inference_steps,
-
         control_video = input_video,
         latents=original_vae_latents,
+        source_prompt = source_generation_prompt,
+        source_dual_pipeline = source_dual_pipeline,
         strength=0.9 if og_video is not None else 1.0,  # you can adjust the strength to control how much noise is added to the original video latents. A higher strength means more noise and more deviation from the original video.
+        directory_latents=directory_latents if directory_latents is not None else None,
     ).videos
 
+kv_cache = pipeline.get_kv_cache()
+torch.save(kv_cache, os.path.join(directory_latents, "kv_cache.pt"))
 if lora_path is not None:
     pipeline = unmerge_lora(pipeline, lora_path, lora_weight, device=device, dtype=weight_dtype)
 
