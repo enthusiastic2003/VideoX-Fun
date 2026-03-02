@@ -125,10 +125,7 @@ fps                 = 30
 weight_dtype            = torch.bfloat16
 # control_video           = "asset/yoga_rev_896x512.mp4"
 control_video           = "asset/depth_map_49_8fps.mp4"
-og_video                = "asset/yoga_resized_896x512_30fps.mp4"  # just for reference, not used in generation
 # og_video                = None  # just for reference, not used in generation
-directory_latents     = f"/home/venky/sirjanhansda/new_folder/VideoX-Fun/latents/{og_video.split('/')[-1].split('.')[0]}" if og_video else None  # directory to save latents, set to None if you don't want to save
-os.makedirs(directory_latents, exist_ok=True) if directory_latents is not None else None
 # prompts
 prompt                  = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
 # prompt                  = "A photorealistic white American woman with light blonde hair performing a slow, controlled yoga transition in a brightly lit room, facing the camera. She begins the pose with one arm gently reaching behind her back, the shoulder open and the chest lifted, maintaining steady balance and calm breathing. As the movement continues, she smoothly brings the same arm forward, extending it in front of her body in a deliberate, mindful motion. Sunlight streams through a nearby window, softly illuminating her face, arms, and clothing throughout the transition. She is wearing black yoga pants and a black tank top, her hair loose around her shoulders. Her facial features remain clearly visible, with a calm, focused expression and a natural, relaxed presence. The scene feels realistic, serene, and grounded, with natural lighting and an unposed, authentic atmosphere."
@@ -139,9 +136,13 @@ num_inference_steps     = 50
 lora_weight             = 0.55
 save_path               = "samples/cogvideox-fun-videos_control"
 
-source_generation_prompt = "N/A"
-source_dual_pipeline = False  # whether to use dual pipeline for source video denoising
+og_video                 = None  # just for reference, not used in generation
+source_generation_prompt = None
+source_depth_video       = None  # the depth video used for dual pipeline source video denoising, which can help improve the quality of the generated video. The depth video should be aligned with the control video and have the same number of frames, height, and width. The depth video should be a single-channel video where the pixel values represent the depth information. The depth information can help the model better understand the spatial structure of the scene and generate more consistent and realistic videos.
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
+
+
+assert (og_video is None and source_depth_video is None and source_generation_prompt is None) or (og_video is not None and source_generation_prompt is not None and source_depth_video is not None), "If you want to use dual pipeline with source video denoising, please provide og_video, source_generation_prompt and source_depth_video at the same time. Otherwise, please set them all to None."
 
 transformer = CogVideoXTransformer3DModel.from_pretrained(
     model_name, 
@@ -253,10 +254,14 @@ latent_frames = (video_length - 1) // vae.config.temporal_compression_ratio + 1
 if video_length != 1 and transformer.config.patch_size_t is not None and latent_frames % transformer.config.patch_size_t != 0:
     additional_frames = transformer.config.patch_size_t - latent_frames % transformer.config.patch_size_t
     video_length += additional_frames * vae.config.temporal_compression_ratio
-input_video, input_video_mask, ref_image, clip_image = get_video_to_video_latent(control_video, video_length=video_length, sample_size=sample_size, fps=fps)
+input_video = get_video_to_video_latent(control_video, video_length=video_length, sample_size=sample_size, fps=fps)[0]
 
 # Encode original video to latents
 original_vae_latents = encode_original_video_to_latents(og_video, video_length, sample_size, fps, pipeline, vae, device) if og_video is not None else None
+
+# Load source depth video frames (pipeline will encode internally)
+source_depth_video_frames = get_video_to_video_latent(source_depth_video, video_length=video_length, sample_size=sample_size, fps=fps)[0] if source_depth_video != None else None
+
 
 with torch.no_grad():
     sample = pipeline(
@@ -269,11 +274,9 @@ with torch.no_grad():
         guidance_scale = guidance_scale,
         num_inference_steps = num_inference_steps,
         control_video = input_video,
-        latents=original_vae_latents,
-        source_prompt = source_generation_prompt, # New thing
-        source_dual_pipeline = source_dual_pipeline,# New thing
-        strength=0.9 if og_video is not None else 1.0,  # you can adjust the strength to control how much noise is added to the original video latents. A higher strength means more noise and more deviation from the original video.
-        directory_latents=directory_latents if directory_latents is not None else None,
+        source_latents=original_vae_latents,
+        source_prompt = source_generation_prompt,
+        source_depth_video = source_depth_video_frames,
     ).videos
 
 if lora_path is not None:
