@@ -270,14 +270,12 @@ with torch.no_grad():
         num_inference_steps = num_inference_steps,
         control_video = input_video,
         latents=original_vae_latents,
-        source_prompt = source_generation_prompt,
-        source_dual_pipeline = source_dual_pipeline,
+        source_prompt = source_generation_prompt, # New thing
+        source_dual_pipeline = source_dual_pipeline,# New thing
         strength=0.9 if og_video is not None else 1.0,  # you can adjust the strength to control how much noise is added to the original video latents. A higher strength means more noise and more deviation from the original video.
         directory_latents=directory_latents if directory_latents is not None else None,
     ).videos
 
-kv_cache = pipeline.get_kv_cache()
-torch.save(kv_cache, os.path.join(directory_latents, "kv_cache.pt"))
 if lora_path is not None:
     pipeline = unmerge_lora(pipeline, lora_path, lora_weight, device=device, dtype=weight_dtype)
 

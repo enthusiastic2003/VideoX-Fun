@@ -309,12 +309,6 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         pass_mode = None
     ):
         super().__init__()
-
-        self.kv_cache = {}
-        self.return_kv_cache = {}
-        if pass_mode is not None:
-            assert pass_mode in ["capture", "inject"], "pass_mode should be either 'capture' or 'inject'"
-            set_kv_injection_processors(transformer, mode=pass_mode, store=self.kv_cache)
         
         self.register_modules(
             tokenizer=tokenizer, text_encoder=text_encoder, vae=vae, transformer=transformer, scheduler=scheduler
@@ -713,6 +707,9 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         max_sequence_length: int = 226,
         comfyui_progressbar: bool = False,
         directory_latents: Optional[str] = None,
+
+        source_dual_pipeline: bool = False,
+        source_prompt: Optional[str] = None,
     ) -> Union[CogVideoXFunPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -846,6 +843,22 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         )
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+
+        # 3b. Encode source prompt if provided
+        source_prompt_embeds = None
+        source_negative_prompt_embeds = None
+        if source_prompt is not None:
+            source_prompt_embeds, source_negative_prompt_embeds = self.encode_prompt(
+                source_prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=True,
+                num_videos_per_prompt=num_videos_per_prompt,
+                prompt_embeds=None,
+                negative_prompt_embeds=None,
+                max_sequence_length=max_sequence_length,
+                device=device,
+                dtype=prompt_embeds.dtype,
+            )
 
         # ============================================================================
         # 4. Prepare timesteps
@@ -988,22 +1001,6 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
                     control_latents=control_latents,
                 )[0]
                 noise_pred = noise_pred.float()
-                
-                # Print KV cache shapes once on first iteration
-                if not kv_shapes_printed and self.kv_cache:
-                    print("\n=== KV Cache Structure ===")
-                    print_kv_cache_shapes(self.kv_cache)
-                    print("=========================\n")
-                    kv_shapes_printed = True
-                
-                kv_cache_size = get_tensor_size(self.kv_cache)
-                print(f"KV Cache size before CPU transfer: {kv_cache_size:.2f} MB")
-                
-                self.return_kv_cache[t] = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.kv_cache.items()}
-                
-                # Clear GPU cache to free memory
-                self.kv_cache.clear()
-                torch.cuda.empty_cache()
 
                 # perform guidance
                 if use_dynamic_cfg:

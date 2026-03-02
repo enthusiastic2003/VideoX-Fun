@@ -40,79 +40,79 @@ from ..dist import (get_sequence_parallel_rank,
 from ..dist.cogvideox_xfuser import CogVideoXMultiGPUsAttnProcessor2_0
 from .attention_utils import attention
 
-class KVInjectionAttnProcessor:
-    def __init__(self, mode="normal", store=None, block_idx=None):
-        self.mode = mode
-        self.store = store
-        self.block_idx = block_idx
+# class KVInjectionAttnProcessor:
+#     def __init__(self, mode="normal", store=None, block_idx=None):
+#         self.mode = mode
+#         self.store = store
+#         self.block_idx = block_idx
 
-    def __call__(
-        self,
-        attn,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        image_rotary_emb: torch.Tensor = None,
-    ) -> torch.Tensor:
-        print(f"[KVInjectionAttnProcessor] called with mode={self.mode} for block {self.block_idx}")
-        text_seq_length = encoder_hidden_states.size(1)
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+#     def __call__(
+#         self,
+#         attn,
+#         hidden_states: torch.Tensor,
+#         encoder_hidden_states: torch.Tensor,
+#         attention_mask: torch.Tensor = None,
+#         image_rotary_emb: torch.Tensor = None,
+#     ) -> torch.Tensor:
+#         print(f"[KVInjectionAttnProcessor] called with mode={self.mode} for block {self.block_idx}")
+#         text_seq_length = encoder_hidden_states.size(1)
+#         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        batch_size, sequence_length, _ = hidden_states.shape
+#         batch_size, sequence_length, _ = hidden_states.shape
 
-        if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+#         if attention_mask is not None:
+#             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+#             attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+#         query = attn.to_q(hidden_states)
+#         key = attn.to_k(hidden_states)
+#         value = attn.to_v(hidden_states)
 
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
+#         inner_dim = key.shape[-1]
+#         head_dim = inner_dim // attn.heads
 
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+#         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+#         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+#         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
+#         if attn.norm_q is not None:
+#             query = attn.norm_q(query)
+#         if attn.norm_k is not None:
+#             key = attn.norm_k(key)
 
-        # No RoPE for CogVideoX 1.1 (uses learned positional embeddings instead)
+#         # No RoPE for CogVideoX 1.1 (uses learned positional embeddings instead)
 
-        # ---- KV Injection logic ----
-        if self.mode == "capture":
-            # Save K,V (only the video tokens, not text tokens)
-            self.store[f"block_{self.block_idx}"] = (
-                key.detach().clone(),
-                value.detach().clone(),
-            )
+#         # ---- KV Injection logic ----
+#         if self.mode == "capture":
+#             # Save K,V (only the video tokens, not text tokens)
+#             self.store[f"block_{self.block_idx}"] = (
+#                 key.detach().clone(),
+#                 value.detach().clone(),
+#             )
 
-        elif self.mode == "inject":
-            source_key, source_value = self.store[f"block_{self.block_idx}"]
-            # Concatenate source K,V along sequence dimension
-            key = torch.cat([key, source_key], dim=2)      # [B, heads, seq+src_seq, head_dim]
-            value = torch.cat([value, source_value], dim=2)
-        # ----------------------------
+#         elif self.mode == "inject":
+#             source_key, source_value = self.store[f"block_{self.block_idx}"]
+#             # Concatenate source K,V along sequence dimension
+#             key = torch.cat([key, source_key], dim=2)      # [B, heads, seq+src_seq, head_dim]
+#             value = torch.cat([value, source_value], dim=2)
+#         # ----------------------------
 
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+#         query = query.transpose(1, 2)
+#         key = key.transpose(1, 2)
+#         value = value.transpose(1, 2)
 
-        hidden_states = attention(
-            query, key, value, attn_mask=None, dropout_p=0.0, causal=False
-        )
-        hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
+#         hidden_states = attention(
+#             query, key, value, attn_mask=None, dropout_p=0.0, causal=False
+#         )
+#         hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
 
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
+#         hidden_states = attn.to_out[0](hidden_states)
+#         hidden_states = attn.to_out[1](hidden_states)
 
-        encoder_hidden_states, hidden_states = hidden_states.split(
-            [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
-        )
-        return hidden_states, encoder_hidden_states
+#         encoder_hidden_states, hidden_states = hidden_states.split(
+#             [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
+#         )
+#         return hidden_states, encoder_hidden_states
 
 class CogVideoXAttnProcessor2_0:
     r"""
