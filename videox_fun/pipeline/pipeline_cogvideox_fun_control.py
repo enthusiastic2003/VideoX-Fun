@@ -867,20 +867,23 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
 
         # ============================================================================
         # 4. Prepare timesteps
-        # [MODIFIED] Added strength parameter support for partial denoising
+        # [MODIFIED] Always run full denoising steps, but switch branches at t_start
         # ============================================================================
-        # IMPORTANT: Always initialize scheduler with full timesteps first
-        timesteps_full, num_inference_steps_full = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        # Get full timestep schedule for complete denoising
+        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         
-        # Then optionally slice to partial timesteps based on strength
+        # Calculate source branch activation timestep
+        # If strength < 1.0 and source_latents provided, compute when to switch from control to source
+        source_branch_start_timestep = None
         if strength < 1.0 and source_latents is not None:
-            # Start from intermediate noise level instead of full denoising
-            print("Full Timesteps are: ", timesteps_full)
-            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
-            print(f"Using strength {strength} for partial denoising. Sliced timesteps are: ", timesteps)
+            # Calculate t_start: the timestep where source branch begins
+            init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+            t_start_idx = max(num_inference_steps - init_timestep, 0)
+            source_branch_start_timestep = timesteps[t_start_idx]
+            print(f"[STRENGTH={strength}] Source branch starts at timestep {source_branch_start_timestep}")
         else:
-            # Standard full denoising from start
-            timesteps, num_inference_steps = timesteps_full, num_inference_steps_full
+            print("[STRENGTH=1.0 or no source_latents] Using control branch only (or full source branch if provided)")
+        
         self._num_timesteps = len(timesteps)
         # ============================================================================
         if comfyui_progressbar:
@@ -956,6 +959,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         # ============================================================================
         # 5b. Prepare source branch (depth video and prompt, latents)
         # [ADDED] Source branch preprocessing following control branch pattern
+        # These will be conditionally used in denoising loop based on current timestep vs source_branch_start_timestep
         # ============================================================================
         source_depth_latents = None
         source_prompt_embeds = None
@@ -988,13 +992,17 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
             # Generate noise with same shape as source latents
             noise = torch.randn(source_latents_clean.shape, device=device, dtype=source_latents_clean.dtype)
             
-            # Get the starting timestep from our sliced timesteps
-            t_start = timesteps[0]
+            # Get the starting timestep for source branch activation
+            # If source_branch_start_timestep is set, use that; otherwise use max timestep (full denoising)
+            if source_branch_start_timestep is not None:
+                t_start = source_branch_start_timestep
+            else:
+                t_start = timesteps[0]  # Full denoising from the beginning
             
             # Add noise to clean source latent to bring it to t_start noise level
             # This enables appearance preservation with strength-based interpolation
             source_latents_noised = self.scheduler.add_noise(source_latents_clean, noise, timesteps=torch.tensor([t_start], device=device))
-            print(f"[STRENGTH={strength}] Added noise to source latents at timestep {t_start}")
+            print(f"[SOURCE LATENTS] Added noise at timestep {t_start}")
             print("Source Latents Shape after noising: ", source_latents_noised.shape)
         
         # Prepare source depth video latents
@@ -1037,7 +1045,11 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
             source_depth_latents = rearrange(source_depth_video_latents_input, "b c f h w -> b f c h w")
             print("Source Depth Latents Shape after rearrange: ", source_depth_latents.shape)
         # ============================================================================
-        # Variables to be used for denoising from source branch are: source_latents_noised,  source_depth_latents, source_prompt_embeds       
+        # Variables prepared for source branch denoising:
+        # - source_latents_noised: Used when t >= source_branch_start_timestep
+        # - source_depth_latents: Used when t >= source_branch_start_timestep
+        # - source_prompt_embeds: Used when t >= source_branch_start_timestep
+        # Before t_start, control branch is used: latents, control_latents, prompt_embeds
         # ============================================================================
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
