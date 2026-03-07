@@ -107,7 +107,7 @@ compile_dit         = False
 model_name          = "models/Diffusion_Transformer/CogVideoX-Fun-V1.1-5b-Control"
 
 # Choose the sampler in "Euler" "Euler A" "DPM++" "PNDM" "DDIM_Cog" and "DDIM_Origin"
-sampler_name        = "DDIM_Origin"
+sampler_name        = "DDIM_Cog"
 
 # Load pretrained model if need
 transformer_path    = None
@@ -123,12 +123,12 @@ fps                 = 30
 # Use torch.float16 if GPU does not support torch.bfloat16
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
 weight_dtype            = torch.bfloat16
-# control_video           = "asset/yoga_rev_896x512.mp4"
-control_video           = "asset/depth_map_49_8fps.mp4"
+control_video           = "asset/yoga_rev_896x512.mp4"
+# control_video           = "asset/depth_map_49_8fps.mp4"
 # og_video                = None  # just for reference, not used in generation
 # prompts
-prompt                  = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
-# prompt                  = "A photorealistic white American woman with light blonde hair performing a slow, controlled yoga transition in a brightly lit room, facing the camera. She begins the pose with one arm gently reaching behind her back, the shoulder open and the chest lifted, maintaining steady balance and calm breathing. As the movement continues, she smoothly brings the same arm forward, extending it in front of her body in a deliberate, mindful motion. Sunlight streams through a nearby window, softly illuminating her face, arms, and clothing throughout the transition. She is wearing black yoga pants and a black tank top, her hair loose around her shoulders. Her facial features remain clearly visible, with a calm, focused expression and a natural, relaxed presence. The scene feels realistic, serene, and grounded, with natural lighting and an unposed, authentic atmosphere."
+# prompt                  = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
+prompt                  = "A photorealistic white American woman with light blonde hair performing a slow, controlled yoga transition in a brightly lit room, facing the camera. She begins the pose with one arm gently reaching behind her back, the shoulder open and the chest lifted, maintaining steady balance and calm breathing. As the movement continues, she smoothly brings the same arm forward, extending it in front of her body in a deliberate, mindful motion. Sunlight streams through a nearby window, softly illuminating her face, arms, and clothing throughout the transition. She is wearing black yoga pants and a black tank top, her hair loose around her shoulders. Her facial features remain clearly visible, with a calm, focused expression and a natural, relaxed presence. The scene feels realistic, serene, and grounded, with natural lighting and an unposed, authentic atmosphere."
 negative_prompt         = "The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion. "
 guidance_scale          = 6.0
 seed                    = 43
@@ -136,9 +136,9 @@ num_inference_steps     = 50
 lora_weight             = 0.55
 save_path               = "samples/cogvideox-fun-videos_control"
 
-og_video                 = None  # just for reference, not used in generation
-source_generation_prompt = None
-source_depth_video       = None  # the depth video used for dual pipeline source video denoising, which can help improve the quality of the generated video. The depth video should be aligned with the control video and have the same number of frames, height, and width. The depth video should be a single-channel video where the pixel values represent the depth information. The depth information can help the model better understand the spatial structure of the scene and generate more consistent and realistic videos.
+og_video                 = "/home/venky/sirjanhansda/new_folder/VideoX-Fun/asset/yoga_resized_896x512_30fps.mp4"  # just for reference, not used in generation
+source_generation_prompt = "A photorealistic woman performing yoga moves carefully in a brightly lit room, sunlight coming through the window illuminates her clothes as she moves. She is wearing black yoga pants with a black tank top, her hair is loose, her backside is fully visible, and the image only shows her backside."
+source_depth_video       = "asset/depth_map_49_8fps.mp4"  # the depth video used for dual pipeline source video denoising, which can help improve the quality of the generated video. The depth video should be aligned with the control video and have the same number of frames, height, and width. The depth video should be a single-channel video where the pixel values represent the depth information. The depth information can help the model better understand the spatial structure of the scene and generate more consistent and realistic videos.
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 
 
@@ -151,6 +151,8 @@ transformer = CogVideoXTransformer3DModel.from_pretrained(
     torch_dtype=weight_dtype,
 ).to(weight_dtype)
 
+print('using rope? ', transformer.config.use_rotary_positional_embeddings)
+exit(0)
 if transformer_path is not None:
     print(f"From checkpoint: {transformer_path}")
     if transformer_path.endswith("safetensors"):
@@ -203,14 +205,14 @@ scheduler = Chosen_Scheduler.from_pretrained(
     subfolder="scheduler"
 )
 
+print("Chosen Scheduler:", sampler_name)
 
 pipeline = CogVideoXFunControlPipeline(
     vae=vae,
     tokenizer=tokenizer,
     text_encoder=text_encoder,
     transformer=transformer,
-    scheduler=scheduler,
-    pass_mode="capture"
+    scheduler=scheduler
 )
 if ulysses_degree > 1 or ring_degree > 1:
     from functools import partial

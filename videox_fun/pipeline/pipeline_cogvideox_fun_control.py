@@ -32,8 +32,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from einops import rearrange
 
-from videox_fun.models.cogvideox_transformer3d import KVInjectionAttnProcessor
-
 from ..models import (AutoencoderKLCogVideoX,
                               CogVideoXTransformer3DModel, T5EncoderModel,
                               T5Tokenizer)
@@ -305,8 +303,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         text_encoder: T5EncoderModel,
         vae: AutoencoderKLCogVideoX,
         transformer: CogVideoXTransformer3DModel,
-        scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler],
-        pass_mode = None
+        scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler]
     ):
         super().__init__()
         
@@ -689,7 +686,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
         guidance_scale: float = 6,
-        strength: float = 1.0,
+        strength: float = 0.9,
         use_dynamic_cfg: bool = False,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
@@ -874,6 +871,7 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         
         # Calculate source branch activation timestep
         # If strength < 1.0 and source_latents provided, compute when to switch from control to source
+        print("Strength: ", strength)
         source_branch_start_timestep = None
         if strength < 1.0 and source_latents is not None:
             # Calculate t_start: the timestep where source branch begins
@@ -1044,12 +1042,23 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
             # 5. Temporal rearrangement for transformer input
             source_depth_latents = rearrange(source_depth_video_latents_input, "b c f h w -> b f c h w")
             print("Source Depth Latents Shape after rearrange: ", source_depth_latents.shape)
+        
+        # ============================================================================
+        # Safety check: If source branch is not being used (no activation timestep),
+        # disable all source guidance variables to avoid partial/accidental usage
+        # ============================================================================
+        if source_branch_start_timestep is None:
+            source_latents_noised = None
+            source_depth_latents = None
+            source_prompt_embeds = None
+            print("[SOURCE BRANCH DISABLED] All source guidance inputs set to None")
+        
         # ============================================================================
         # Variables prepared for source branch denoising:
-        # - source_latents_noised: Used when t >= source_branch_start_timestep
-        # - source_depth_latents: Used when t >= source_branch_start_timestep
-        # - source_prompt_embeds: Used when t >= source_branch_start_timestep
-        # Before t_start, control branch is used: latents, control_latents, prompt_embeds
+        # - source_latents_noised: Only used when source_branch_start_timestep is set AND t <= threshold
+        # - source_depth_latents: Only used when source_branch_start_timestep is set AND t <= threshold
+        # - source_prompt_embeds: Only used when source_branch_start_timestep is set AND t <= threshold
+        # Control branch always: latents, control_latents, prompt_embeds
         # ============================================================================
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -1069,26 +1078,67 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             # for DPM-solver++
             old_pred_original_sample = None
+            old_source_pred_original_sample = None
+
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
+                # ================================================================
+                # Prepare control branch inputs (always active)
+                # ================================================================
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # ================================================================
+                # Prepare source branch inputs (conditionally active based on timestep threshold)
+                # ================================================================
+                # Determine if source branch should be active at current timestep
+                source_branch_is_active = (
+                    source_branch_start_timestep is not None and 
+                    t <= source_branch_start_timestep
+                )
+                
+                if source_branch_is_active:
+                    print(f"[TIMESTEP {t}] Source branch ACTIVE (t <= {source_branch_start_timestep}) - using source guidance inputs")
+                    # Source branch is ACTIVE: Prepare source guidance inputs
+                    # Apply CFG duplication if needed, then scale by scheduler
+                    source_latent_model_input = torch.cat([source_latents_noised] * 2) if do_classifier_free_guidance else source_latents_noised
+                    source_latent_model_input = self.scheduler.scale_model_input(source_latent_model_input, t)
+                    source_control_latents = source_depth_latents
+                    source_prompt_embeds_input = source_prompt_embeds
+                else:
+                    print(f"[TIMESTEP {t}] Source branch INACTIVE (t > {source_branch_start_timestep if source_branch_start_timestep is not None else 'N/A'}) - using control branch only")
+                    # Source branch is INACTIVE: All source inputs are None
+                    source_latent_model_input = None
+                    source_control_latents = None
+                    source_prompt_embeds_input = None
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
                 # predict noise model_output
-                noise_pred = self.transformer(
+                noise_pred, source_noise_pred = self.transformer(
+                    # Control branch (always)
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
+                    control_latents=control_latents,
+                    
+                    # Source branch (conditional)
+                    source_latent_model_input=source_latent_model_input,
+                    source_control_latents=source_control_latents,
+                    source_prompt_embeds=source_prompt_embeds_input,
+                    
+                    # Transformer config
                     timestep=timestep,
                     image_rotary_emb=image_rotary_emb,
                     return_dict=False,
-                    control_latents=control_latents,
-                )[0]
+                )
                 noise_pred = noise_pred.float()
+                
+                if source_noise_pred is not None:
+
+                    source_noise_pred = source_noise_pred.float()
 
                 # perform guidance
                 if use_dynamic_cfg:
@@ -1098,20 +1148,52 @@ class CogVideoXFunControlPipeline(DiffusionPipeline):
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    if source_branch_is_active and source_noise_pred is not None:
+                        source_noise_pred_uncond, source_noise_pred_text = source_noise_pred.chunk(2)
+                        source_noise_pred = source_noise_pred_uncond + self.guidance_scale * (
+                            source_noise_pred_text - source_noise_pred_uncond
+                        )
 
                 # compute the previous noisy sample x_t -> x_t-1
                 if not isinstance(self.scheduler, CogVideoXDPMScheduler):
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                else:
-                    latents, old_pred_original_sample = self.scheduler.step(
-                        noise_pred,
-                        old_pred_original_sample,
-                        t,
-                        timesteps[i - 1] if i > 0 else None,
-                        latents,
+                    result = self.scheduler.step(
+                        model_output=noise_pred,
+                        timestep=t,
+                        sample=latents,
+                        source_model_output=source_noise_pred if source_branch_is_active else None,
+                        source_sample=source_latents_noised if source_branch_is_active else None,
                         **extra_step_kwargs,
                         return_dict=False,
                     )
+                    
+                    # Unpack results (always returns 4-tuple for compatibility)
+                    latents = result[0]
+                    if source_branch_is_active:
+                        print(f"[Pipeline] DDIM step with source branch active: {source_branch_is_active}")
+                        source_latents_noised = result[2]
+                else:
+                    print(f"[Pipeline] Using DPM Scheduler step - source branch active: {source_branch_is_active}")
+                    # Call DPM scheduler with optional source branch parameters
+                    result = self.scheduler.step(
+                        model_output=noise_pred,
+                        old_pred_original_sample=old_pred_original_sample,
+                        timestep=t,
+                        timestep_back=timesteps[i - 1] if i > 0 else None,
+                        sample=latents,
+                        source_model_output=source_noise_pred if source_branch_is_active else None,
+                        source_old_pred_original_sample=old_source_pred_original_sample if source_branch_is_active else None,
+                        source_sample=source_latents_noised if source_branch_is_active else None,
+                        **extra_step_kwargs,
+                        return_dict=False,
+                    )
+                    
+                    # Unpack results (always returns 4-tuple: control_prev, control_pred, source_prev, source_pred)
+                    latents = result[0]
+                    old_pred_original_sample = result[1]
+                    if source_branch_is_active:
+                        source_latents_noised = result[2]
+                        old_source_pred_original_sample = result[3]
+                
                 latents = latents.to(prompt_embeds.dtype)
                 # Save latents to a folder
 

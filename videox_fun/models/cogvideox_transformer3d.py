@@ -131,7 +131,14 @@ class CogVideoXAttnProcessor2_0:
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor = None,
         image_rotary_emb: torch.Tensor = None,
+        mode:str = "collect",
+        kv_store: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        if mode == "collect":
+            assert kv_store is None, "kv_store must be None when mode is 'collect'"
+        elif mode == "inject":
+            assert kv_store is not None, "kv_store must be provided when mode is 'inject'"
+                
         text_seq_length = encoder_hidden_states.size(1)
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -170,6 +177,17 @@ class CogVideoXAttnProcessor2_0:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
+        if mode == "collect":
+            kv_store = {}
+            # Store K,V (only the video tokens, not text tokens)
+            kv_store["key"] = key.detach().clone()
+            kv_store["value"] = value.detach().clone()
+        elif mode == "inject":
+            # Concatenate the target generation's keys/values with the cached 
+            # source keys/values along the sequence dimension (dim=1)
+            key = torch.cat([key, kv_store["key"]], dim=1)
+            value = torch.cat([value, kv_store["value"]], dim=1)
+
         hidden_states = attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, causal=False
         )
@@ -183,7 +201,10 @@ class CogVideoXAttnProcessor2_0:
         encoder_hidden_states, hidden_states = hidden_states.split(
             [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
         )
-        return hidden_states, encoder_hidden_states
+        if mode == "collect":
+            return hidden_states, encoder_hidden_states, kv_store
+        else:
+            return hidden_states, encoder_hidden_states
 
 
 class CogVideoXPatchEmbed(nn.Module):
@@ -403,8 +424,18 @@ class CogVideoXBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        mode: str = "collect",
+        kv_store: Optional[dict] = None,
     ) -> torch.Tensor:
         text_seq_length = encoder_hidden_states.size(1)
+
+        # Assert that mode is either "collect" or "inject"
+        if mode is "collect":
+           assert kv_store is None, "kv_store must be None when mode is 'collect'"
+        elif mode is "inject":
+          assert kv_store is not None, "kv_store must be provided when mode is 'inject'"
+        elif mode not in ["collect", "inject", "default"]:
+            raise ValueError(f"Invalid mode {mode} for CogVideoXBlock. Supported modes are 'collect', 'inject', and 'default'.")
 
         # norm & modulate
         norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
@@ -412,11 +443,31 @@ class CogVideoXBlock(nn.Module):
         )
 
         # attention
-        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-        )
+        if mode == "collect":
+            attn_hidden_states, attn_encoder_hidden_states, kv_store = self.attn1(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                mode=mode,
+                kv_store=None
+            )
+        elif mode == "inject":
+            attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                mode=mode,
+                kv_store = kv_store
+            )
+        else:
+            attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                mode=mode,
+                kv_store = None
+            )
+
 
         hidden_states = hidden_states + gate_msa * attn_hidden_states
         encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
@@ -433,7 +484,10 @@ class CogVideoXBlock(nn.Module):
         hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
         encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
 
-        return hidden_states, encoder_hidden_states
+        if mode == "collect":
+            return hidden_states, encoder_hidden_states, kv_store
+        else:
+            return hidden_states, encoder_hidden_states
 
 
 class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
@@ -721,6 +775,9 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
         inpaint_latents: Optional[torch.Tensor] = None,
         control_latents: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        source_latent_model_input: Optional[torch.Tensor] = None,
+        source_control_latents: Optional[torch.Tensor] = None,
+        source_prompt_embeds: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
         batch_size, num_frames, channels, height, width = hidden_states.shape
@@ -730,6 +787,10 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
                 inpaint_latents = torch.concat([inpaint_latents, torch.zeros_like(inpaint_latents)], dim=1)
             if control_latents is not None:
                 control_latents = torch.concat([control_latents, torch.zeros_like(control_latents)], dim=1)
+            if source_latent_model_input is not None:
+                source_latent_model_input = torch.concat([source_latent_model_input, torch.zeros_like(source_latent_model_input)], dim=1)
+            if source_control_latents is not None:
+                source_control_latents = torch.concat([source_control_latents, torch.zeros_like(source_control_latents)], dim=1)
             local_num_frames = num_frames + 1
         else:
             local_num_frames = num_frames
@@ -756,9 +817,24 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
 
+        # 2b. Source branch patch embedding (if provided)
+        source_encoder_hidden_states = None
+        source_hidden_states = None
+        if source_latent_model_input is not None and source_prompt_embeds is not None:
+            if source_control_latents is not None:
+                source_latent_model_input = torch.concat([source_latent_model_input, source_control_latents], 2)
+            source_hidden_states_combined = self.patch_embed(source_prompt_embeds, source_latent_model_input)
+            source_hidden_states_combined = self.embedding_dropout(source_hidden_states_combined)
+            
+            source_text_seq_length = source_prompt_embeds.shape[1]
+            source_encoder_hidden_states = source_hidden_states_combined[:, :source_text_seq_length]
+            source_hidden_states = source_hidden_states_combined[:, source_text_seq_length:]
+
         # Context Parallel
         if self.sp_world_size > 1:
             hidden_states = torch.chunk(hidden_states, self.sp_world_size, dim=1)[self.sp_world_rank]
+            if source_hidden_states is not None:
+                source_hidden_states = torch.chunk(source_hidden_states, self.sp_world_size, dim=1)[self.sp_world_rank]
             if image_rotary_emb is not None:
                 image_rotary_emb = (
                     torch.chunk(image_rotary_emb[0], self.sp_world_size, dim=0)[self.sp_world_rank],
@@ -776,6 +852,21 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                
+                # Source branch (if active) - collect K,V
+                if source_hidden_states is not None:
+                    source_output = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        source_hidden_states,
+                        source_encoder_hidden_states,
+                        emb,
+                        image_rotary_emb,
+                        None,  # mode defaults to "collect"
+                        **ckpt_kwargs,
+                    )
+                    source_hidden_states, source_encoder_hidden_states, kv_store = source_output
+                
+                # Control branch
                 hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
@@ -785,48 +876,104 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
                     **ckpt_kwargs,
                 )
             else:
-                hidden_states, encoder_hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=emb,
-                    image_rotary_emb=image_rotary_emb,
-                )
+                # Source branch (if active) - collect K,V
+                if source_hidden_states is not None:
+                    source_output = block(
+                        hidden_states=source_hidden_states,
+                        encoder_hidden_states=source_encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                        mode="collect",
+                    )
+                    source_hidden_states, source_encoder_hidden_states, kv_store = source_output
+                
+                    # Control branch
+                    hidden_states, encoder_hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                        mode="inject",
+                        kv_store=kv_store if source_hidden_states is not None else None,
+                    )
+                else:
+                    # Control branch
+                    hidden_states, encoder_hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                        mode="default",
+                        kv_store=None
+                    )
 
         if not self.config.use_rotary_positional_embeddings:
             # CogVideoX-2B
             hidden_states = self.norm_final(hidden_states)
+            if source_hidden_states is not None:
+                source_hidden_states = self.norm_final(source_hidden_states)
         else:
             # CogVideoX-5B
             hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
             hidden_states = self.norm_final(hidden_states)
             hidden_states = hidden_states[:, text_seq_length:]
+            
+            if source_hidden_states is not None:
+                source_hidden_states = torch.cat([source_encoder_hidden_states, source_hidden_states], dim=1)
+                source_hidden_states = self.norm_final(source_hidden_states)
+                source_hidden_states = source_hidden_states[:, source_text_seq_length:]
 
         # 4. Final block
         hidden_states = self.norm_out(hidden_states, temb=emb)
         hidden_states = self.proj_out(hidden_states)
+        
+        source_hidden_states_output = None
+        if source_hidden_states is not None:
+            source_hidden_states = self.norm_out(source_hidden_states, temb=emb)
+            source_hidden_states_output = self.proj_out(source_hidden_states)
 
         if self.sp_world_size > 1:
             hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+            if source_hidden_states_output is not None:
+                source_hidden_states_output = get_sp_group().all_gather(source_hidden_states_output, dim=1)
 
         # 5. Unpatchify
         p = self.config.patch_size
         p_t = self.config.patch_size_t
 
+        # Get actual batch size from hidden_states (may include CFG doubling)
+        actual_batch_size = hidden_states.shape[0]
+        
         if p_t is None:
-            output = hidden_states.reshape(batch_size, local_num_frames, height // p, width // p, -1, p, p)
+            output = hidden_states.reshape(actual_batch_size, local_num_frames, height // p, width // p, -1, p, p)
             output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
         else:
             output = hidden_states.reshape(
-                batch_size, (local_num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+                actual_batch_size, (local_num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
             )
             output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
         
         if num_frames == 1:
             output = output[:, :num_frames, :]
 
+        # Source branch unpatchify - use SAME actual batch size for consistency
+        source_output = None
+        if source_hidden_states_output is not None:
+            if p_t is None:
+                source_output = source_hidden_states_output.reshape(actual_batch_size, local_num_frames, height // p, width // p, -1, p, p)
+                source_output = source_output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+            else:
+                source_output = source_hidden_states_output.reshape(
+                    actual_batch_size, (local_num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+                )
+                source_output = source_output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+            
+            if num_frames == 1:
+                source_output = source_output[:, :num_frames, :]
+
         if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+            return (output, source_output)
+        return Transformer2DModelOutput(sample=output, source_sample=source_output)
 
     @classmethod
     def from_pretrained(
